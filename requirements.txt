@@ -1,5 +1,4 @@
 pandas
 plotly
-streamlit==1.19.0
-altair<5
+streamlit>=1.44,<2
 pyarrow
