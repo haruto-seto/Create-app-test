@@ -1,16 +1,11 @@
 from pathlib import Path
 from math import ceil
 from typing import IO
-
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-
-
 CSV_PATH = Path(__file__).with_name("lh2_testdata.csv")
 MAX_METRICS = 9
-
-
 def _detect_encoding(file_source: str | IO[bytes]) -> str:
     """UTF-8 → cp932 → latin-1 の順で読めるエンコーディングを返す。"""
     for enc in ("utf-8", "cp932", "latin-1"):
@@ -19,30 +14,33 @@ def _detect_encoding(file_source: str | IO[bytes]) -> str:
                 with open(file_source, encoding=enc) as f:
                     f.read(4096)
             else:
+                # file-like object の場合、バイナリ読み出し→デコードを試みる
+                current_pos = None
+                try:
+                    current_pos = file_source.tell()
+                except Exception:
+                    current_pos = None
                 file_source.seek(0)
-                file_source.read(4096).decode(enc)
-                file_source.seek(0)
+                chunk = file_source.read(4096)
+                if isinstance(chunk, bytes):
+                    chunk.decode(enc)
+                else:
+                    # StringIO などテキストストリームの場合は既に文字列として読める
+                    # ここでは問題ないとみなす
+                    pass
+                if current_pos is not None:
+                    try:
+                        file_source.seek(current_pos)
+                    except Exception:
+                        pass
             return enc
         except (UnicodeDecodeError, AttributeError):
-            if not isinstance(file_source, str):
-                try:
-                    file_source.seek(0)
-                except Exception:
-                    pass
+            # 次のエンコーディングを試す
+            continue
     return "latin-1"
-
-
 @st.cache_data(show_spinner=False)
 def load_units(file_source: str | IO[bytes]) -> dict[str, str]:
-    """CSVの2行目が単位行であればカラム名→単位の辞書を返す。Parquetは常に空辞書。"""
-    # Parquet には単位行なし
-    is_parquet = (
-        isinstance(file_source, str) and file_source.endswith(".parquet")
-    ) or (
-        hasattr(file_source, "name") and getattr(file_source, "name", "").endswith(".parquet")
-    )
-    if is_parquet:
-        return {}
+    """CSVの2行目が単位行であればカラム名→単位の辞書を返す。"""
     enc = _detect_encoding(file_source)
     raw = pd.read_csv(file_source, nrows=2, encoding=enc)
     if len(raw) < 1:
@@ -52,22 +50,10 @@ def load_units(file_source: str | IO[bytes]) -> dict[str, str]:
     if pd.isna(pd.to_numeric(first_row.get(first_col, ""), errors="coerce")):
         return {col: str(val) for col, val in first_row.items() if pd.notna(val)}
     return {}
-
-
 @st.cache_data(show_spinner=False)
 def load_data(file_source: str | IO[bytes]) -> pd.DataFrame:
-    is_parquet = (
-        isinstance(file_source, str) and file_source.endswith(".parquet")
-    ) or (
-        hasattr(file_source, "name") and getattr(file_source, "name", "").endswith(".parquet")
-    )
-    if is_parquet:
-        dataframe = pd.read_parquet(file_source)
-        if len(dataframe.columns) == 0:
-            raise ValueError("Parquetに列がありません。")
-        for col in dataframe.columns:
-            dataframe[col] = pd.to_numeric(dataframe[col], errors="coerce")
-    else:
+    """CSVを読み込み、timeカラムを補正してソートしたDataFrameを返す。"""
+    try:
         enc = _detect_encoding(file_source)
         dataframe = pd.read_csv(file_source, encoding=enc)
         if len(dataframe.columns) == 0:
@@ -77,11 +63,23 @@ def load_data(file_source: str | IO[bytes]) -> pd.DataFrame:
         dataframe = dataframe[numeric_mask].reset_index(drop=True)
         for col in dataframe.columns:
             dataframe[col] = pd.to_numeric(dataframe[col], errors="coerce")
-
-    dataframe = dataframe.sort_values("time").reset_index(drop=True)
-    return dataframe
-
-
+        # "time" カラムがない場合、代替カラムを探してリネーム
+        if "time" not in dataframe.columns:
+            time_candidates = ["Time", "tLap", "time_utc", "time_Rate1"]
+            for candidate in time_candidates:
+                if candidate in dataframe.columns:
+                    dataframe = dataframe.rename(columns={candidate: "time"})
+                    break
+            else:
+                available_cols = ", ".join(dataframe.columns[:10])
+                raise ValueError(
+                    f"'time' カラムが見つかりません。\n"
+                    f"利用可能なカラム(最初の10個): {available_cols}"
+                )
+        dataframe = dataframe.sort_values("time").reset_index(drop=True)
+        return dataframe
+    except Exception as e:
+        raise Exception(f"データ読み込みエラー: {str(e)}") from e
 def metric_summary(dataframe: pd.DataFrame, metric_name: str) -> tuple[str, str, str]:
     series = pd.to_numeric(dataframe[metric_name], errors="coerce")
     if series.notna().sum() == 0:
@@ -94,8 +92,6 @@ def metric_summary(dataframe: pd.DataFrame, metric_name: str) -> tuple[str, str,
         f"min {minimum_value:.3f}",
         f"max {maximum_value:.3f}",
     )
-
-
 def build_threshold_segments(
     dataframe: pd.DataFrame,
     metric_name: str,
@@ -104,9 +100,7 @@ def build_threshold_segments(
 ) -> pd.DataFrame:
     time_values = dataframe[x_col].tolist()
     y_values = pd.to_numeric(dataframe[metric_name], errors="coerce").tolist()
-
     segmented_rows: list[dict[str, float | None]] = []
-
     def append_point(time_value: float, y_value: float, force_exceed: bool | None = None) -> None:
         is_exceed = force_exceed if force_exceed is not None else y_value > threshold
         segmented_rows.append(
@@ -116,18 +110,14 @@ def build_threshold_segments(
                 "exceed": y_value if is_exceed else None,
             }
         )
-
     if not time_values:
         return pd.DataFrame(columns=[x_col, "normal", "exceed"])
-
     append_point(time_values[0], y_values[0])
-
     for index in range(len(time_values) - 1):
         start_time = time_values[index]
         end_time = time_values[index + 1]
         start_value = y_values[index]
         end_value = y_values[index + 1]
-
         if pd.notna(start_value) and pd.notna(end_value):
             crossed_threshold = (start_value - threshold) * (end_value - threshold) < 0
             if crossed_threshold and end_time != start_time:
@@ -136,12 +126,8 @@ def build_threshold_segments(
                 start_exceeds = start_value > threshold
                 append_point(cross_time, threshold, force_exceed=start_exceeds)
                 append_point(cross_time, threshold, force_exceed=not start_exceeds)
-
         append_point(end_time, end_value)
-
     return pd.DataFrame(segmented_rows)
-
-
 def render_chart(
     dataframe: pd.DataFrame,
     metric_name: str,
@@ -152,7 +138,6 @@ def render_chart(
 ) -> None:
     segmented_df = build_threshold_segments(dataframe, metric_name, threshold, x_col)
     marker_style = dict(size=5) if show_markers else None
-
     figure = go.Figure()
     figure.add_trace(
         go.Scatter(
@@ -177,7 +162,6 @@ def render_chart(
         )
     )
     has_data = pd.to_numeric(dataframe[metric_name], errors="coerce").notna().any()
-
     if has_data:
         figure.add_hline(
             y=threshold,
@@ -187,7 +171,6 @@ def render_chart(
             annotation_text=f"最大閾値 {threshold:.3f}",
             annotation_position="top left",
         )
-
     layout_annotations = []
     if not has_data:
         layout_annotations.append(
@@ -201,13 +184,11 @@ def render_chart(
                 font=dict(size=28, color="rgba(200, 80, 80, 0.45)"),
             )
         )
-
     _units = units or {}
     x_unit = _units.get(x_col, "")
     metric_unit = _units.get(metric_name, "")
     xaxis_label = f"{x_col} [{x_unit}]" if x_unit else x_col
     yaxis_label = f"{metric_name} [{metric_unit}]" if metric_unit else metric_name
-
     figure.update_layout(
         template="plotly_white",
         title=metric_name,
@@ -220,10 +201,7 @@ def render_chart(
         annotations=layout_annotations,
     )
     st.plotly_chart(figure, width="stretch")
-
-
 st.set_page_config(page_title="LH2 Public Dashboard", page_icon="📈", layout="wide")
-
 st.markdown(
     """
     <style>
@@ -270,7 +248,6 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-
 st.markdown(
     """
     <div class="hero">
@@ -280,29 +257,38 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-
 with st.sidebar:
     st.header("表示設定")
-    uploaded_file = st.file_uploader("CSV / Parquetをアップロード", type=["csv", "parquet"])
+    uploaded_file = st.file_uploader("CSVをアップロード", type=["csv"])
     chart_columns = st.slider("1行あたりのグラフ数", min_value=1, max_value=3, value=3)
     use_markers = st.toggle("折れ線にマーカーを表示", value=False)
     with st.expander("描画最適化", expanded=False):
         enable_downsample = st.toggle("大容量時に間引いて描画", value=True)
         max_plot_points = st.slider("表示点数の上限", min_value=300, max_value=5000, value=1200, step=100)
-
 try:
     data_source = uploaded_file if uploaded_file is not None else str(CSV_PATH)
+    st.write(f"📂 データソース: {data_source if isinstance(data_source, str) else 'アップロードファイル'}")
+  
     df = load_data(data_source)
+    st.write(f"✓ データ読み込み完了: {len(df)} 行, {len(df.columns)} 列")
+  
     units = load_units(data_source)
+    st.write(f"✓ ユニット情報読み込み完了")
 except Exception as exc:
-    st.error(f"CSVの読み込みに失敗しました: {exc}")
+    st.error(f"❌ データ読み込み失敗: {exc}")
     st.stop()
-
 x_col = "time"
-
-metric_columns = [column for column in df.columns if column != x_col and column != "lap"]
+# メトリクスカラムをフィルタリング（数値型のみ）
+metric_columns = [
+    column for column in df.columns
+    if column != x_col
+    and column.lower() not in ["lap", "lapcount"]
+    and pd.api.types.is_numeric_dtype(df[column])
+]
+# 上限に達するまでのカラムのみ使用
+if len(metric_columns) > MAX_METRICS * 3:
+    metric_columns = metric_columns[:MAX_METRICS * 3]
 default_metrics = metric_columns[:MAX_METRICS]
-
 with st.sidebar:
     selected_metrics = st.multiselect(
         "表示する系列",
@@ -311,21 +297,17 @@ with st.sidebar:
         max_selections=MAX_METRICS,
         help="公開画面向けに最大9系列まで選択できます。",
     )
-
 if not selected_metrics:
     st.warning("少なくとも1系列を選択してください。")
     st.stop()
-
 thresholds: dict[str, float] = {}
 with st.sidebar.expander("系列ごとの最大閾値", expanded=True):
     def sync_from_input(value_key: str, input_key: str, slider_key: str) -> None:
         st.session_state[value_key] = float(st.session_state[input_key])
         st.session_state[slider_key] = float(st.session_state[input_key])
-
     def sync_from_slider(value_key: str, input_key: str, slider_key: str) -> None:
         st.session_state[value_key] = float(st.session_state[slider_key])
         st.session_state[input_key] = float(st.session_state[slider_key])
-
     for metric_name in selected_metrics:
         series = pd.to_numeric(df[metric_name], errors="coerce")
         metric_min = float(series.min()) if series.notna().any() else 0.0
@@ -333,21 +315,17 @@ with st.sidebar.expander("系列ごとの最大閾値", expanded=True):
         if metric_min == metric_max:
             metric_min -= 1.0
             metric_max += 1.0
-
         value_key = f"threshold_value_{metric_name}"
         input_key = f"threshold_input_{metric_name}"
         slider_key = f"threshold_slider_{metric_name}"
-
         if value_key not in st.session_state:
             st.session_state[value_key] = float(series.max()) if series.notna().any() else 0.0
         if input_key not in st.session_state:
             st.session_state[input_key] = st.session_state[value_key]
         if slider_key not in st.session_state:
             st.session_state[slider_key] = st.session_state[value_key]
-
         st.markdown(f"**{metric_name}**")
         input_col, slider_col = st.columns([1, 2])
-
         with input_col:
             st.number_input(
                 "直接入力",
@@ -368,9 +346,7 @@ with st.sidebar.expander("系列ごとの最大閾値", expanded=True):
                 on_change=sync_from_slider,
                 args=(value_key, input_key, slider_key),
             )
-
         thresholds[metric_name] = float(st.session_state[value_key])
-
 plot_df = df
 if enable_downsample and len(df) > max_plot_points:
     step = ceil(len(df) / max_plot_points)
@@ -378,16 +354,12 @@ if enable_downsample and len(df) > max_plot_points:
     if len(plot_df) > 0 and plot_df.iloc[-1][x_col] != df.iloc[-1][x_col]:
         plot_df = pd.concat([plot_df, df.tail(1)], ignore_index=True)
     st.caption(f"表示高速化のため {len(df):,} 行を {len(plot_df):,} 点に間引いて表示しています。")
-
 METRIC_GROUPS: list[tuple[str, list[str]]] = [
     ("LH2Tank",   ["pLH2Tank", "xLH2TankLevel", "pLH2BufferTank", "TLH2BufferTank"]),
     ("Vaporizer", ["TLH2VaporizerIn", "TGH2VaporizerOut", "pLH2VaporizerIn"]),
     ("Regulator", ["pGH2RegIn", "pGH2regOut"]),
 ]
-
 overview_tab, data_tab = st.tabs(["ダッシュボード", "データ"])
-
-
 def _render_metric_grid(metrics: list[str]) -> None:
     for start_index in range(0, len(metrics), chart_columns):
         grid_columns = st.columns(chart_columns)
@@ -402,14 +374,10 @@ def _render_metric_grid(metrics: list[str]) -> None:
                     f"最新値 {latest_value} | {min_label} | {max_label} | 超過点数 {exceed_count}"
                 )
                 render_chart(plot_df, metric_name, use_markers, thresholds[metric_name], units, x_col)
-
-
 with overview_tab:
     if uploaded_file is None:
         st.info("現在は同梱サンプルCSVを表示しています。共有時はサイドバーから任意CSVへ切り替えできます。")
-
     rendered: set[str] = set()
-
     for group_name, group_members in METRIC_GROUPS:
         metrics_in_group = [m for m in group_members if m in selected_metrics]
         if not metrics_in_group:
@@ -421,7 +389,6 @@ with overview_tab:
         st.divider()
         _render_metric_grid(metrics_in_group)
         rendered.update(metrics_in_group)
-
     ungrouped = [m for m in selected_metrics if m not in rendered]
     if ungrouped:
         st.markdown(
@@ -430,7 +397,6 @@ with overview_tab:
         )
         st.divider()
         _render_metric_grid(ungrouped)
-
 with data_tab:
     st.subheader("プレビュー")
     st.dataframe(df.head(20), width="stretch")

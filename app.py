@@ -1,10 +1,9 @@
-"""Streamlit entrypoint for the LH2 dashboard."""
+"""Backward-compatible Streamlit entrypoint.
 
-import importlib
+Some environments still run `streamlit run app.py`.
+This file keeps that command working while the main app lives in PH2_vital.py.
+"""
 
-import PH2_vital
-
-
-# `from module import *` だとStreamlitのリロード時に再実行されず白画面になるため、
-# 毎回モジュールをリロードして描画処理を確実に実行する。
-importlib.reload(PH2_vital)
+# Keep this file as a minimal compatibility shim.
+# The actual Streamlit app is defined in PH2_vital.py.
+import PH2_vital  # noqa: F401

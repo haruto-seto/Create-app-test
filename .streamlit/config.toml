@@ -7,3 +7,10 @@ textColor = "#0b2940"
 
 [server]
 headless = true
+address = "0.0.0.0"
+port = 10000
+enableCORS = false
+enableXsrfProtection = false
+
+[browser]
+gatherUsageStats = false
